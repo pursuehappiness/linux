@@ -1,12 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * leds-lp3944.c - driver for National Semiconductor LP3944 Funlight Chip
  *
  * Copyright (C) 2009 Antonio Ospite <ospite@studenti.unina.it>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
  */
 
 /*
@@ -199,8 +195,11 @@ static int lp3944_led_set(struct lp3944_led_data *led, u8 status)
 	if (status > LP3944_LED_STATUS_DIM1)
 		return -EINVAL;
 
-	/* invert only 0 and 1, leave unchanged the other values,
-	 * remember we are abusing status to set blink patterns
+	/*
+	 * Invert status only when it's < 2 (i.e. 0 or 1) which means it's
+	 * controlling the on/off state directly.
+	 * When, instead, status is >= 2 don't invert it because it would mean
+	 * to mess with the hardware blinking mode.
 	 */
 	if (led->type == LP3944_LED_TYPE_LED_INVERTED && status < 2)
 		status = 1 - status;

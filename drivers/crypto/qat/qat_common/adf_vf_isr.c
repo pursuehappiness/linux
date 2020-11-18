@@ -1,49 +1,5 @@
-/*
-  This file is provided under a dual BSD/GPLv2 license.  When using or
-  redistributing this file, you may do so under either license.
-
-  GPL LICENSE SUMMARY
-  Copyright(c) 2014 Intel Corporation.
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of version 2 of the GNU General Public License as
-  published by the Free Software Foundation.
-
-  This program is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-  General Public License for more details.
-
-  Contact Information:
-  qat-linux@intel.com
-
-  BSD LICENSE
-  Copyright(c) 2014 Intel Corporation.
-  Redistribution and use in source and binary forms, with or without
-  modification, are permitted provided that the following conditions
-  are met:
-
-    * Redistributions of source code must retain the above copyright
-      notice, this list of conditions and the following disclaimer.
-    * Redistributions in binary form must reproduce the above copyright
-      notice, this list of conditions and the following disclaimer in
-      the documentation and/or other materials provided with the
-      distribution.
-    * Neither the name of Intel Corporation nor the names of its
-      contributors may be used to endorse or promote products derived
-      from this software without specific prior written permission.
-
-  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
+// SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0-only)
+/* Copyright(c) 2014 - 2020 Intel Corporation */
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/types.h>
@@ -51,6 +7,7 @@
 #include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/interrupt.h>
+#include <linux/workqueue.h>
 #include "adf_accel_devices.h"
 #include "adf_common_drv.h"
 #include "adf_cfg.h"
@@ -63,6 +20,13 @@
 #define ADF_VINTSOU_OFFSET	0x204
 #define ADF_VINTSOU_BUN		BIT(0)
 #define ADF_VINTSOU_PF2VF	BIT(1)
+
+static struct workqueue_struct *adf_vf_stop_wq;
+
+struct adf_vf_stop_data {
+	struct adf_accel_dev *accel_dev;
+	struct work_struct work;
+};
 
 static int adf_enable_msi(struct adf_accel_dev *accel_dev)
 {
@@ -90,6 +54,20 @@ static void adf_disable_msi(struct adf_accel_dev *accel_dev)
 	pci_disable_msi(pdev);
 }
 
+static void adf_dev_stop_async(struct work_struct *work)
+{
+	struct adf_vf_stop_data *stop_data =
+		container_of(work, struct adf_vf_stop_data, work);
+	struct adf_accel_dev *accel_dev = stop_data->accel_dev;
+
+	adf_dev_stop(accel_dev);
+	adf_dev_shutdown(accel_dev);
+
+	/* Re-enable PF2VF interrupts */
+	adf_enable_pf2vf_interrupts(accel_dev);
+	kfree(stop_data);
+}
+
 static void adf_pf2vf_bh_handler(void *data)
 {
 	struct adf_accel_dev *accel_dev = data;
@@ -107,11 +85,29 @@ static void adf_pf2vf_bh_handler(void *data)
 		goto err;
 
 	switch ((msg & ADF_PF2VF_MSGTYPE_MASK) >> ADF_PF2VF_MSGTYPE_SHIFT) {
-	case ADF_PF2VF_MSGTYPE_RESTARTING:
+	case ADF_PF2VF_MSGTYPE_RESTARTING: {
+		struct adf_vf_stop_data *stop_data;
+
 		dev_dbg(&GET_DEV(accel_dev),
 			"Restarting msg received from PF 0x%x\n", msg);
-		adf_dev_stop(accel_dev);
-		break;
+
+		clear_bit(ADF_STATUS_PF_RUNNING, &accel_dev->status);
+
+		stop_data = kzalloc(sizeof(*stop_data), GFP_ATOMIC);
+		if (!stop_data) {
+			dev_err(&GET_DEV(accel_dev),
+				"Couldn't schedule stop for vf_%d\n",
+				accel_dev->accel_id);
+			return;
+		}
+		stop_data->accel_dev = accel_dev;
+		INIT_WORK(&stop_data->work, adf_dev_stop_async);
+		queue_work(adf_vf_stop_wq, &stop_data->work);
+		/* To ack, clear the PF2VFINT bit */
+		msg &= ~ADF_PF2VF_INT;
+		ADF_CSR_WR(pmisc_bar_addr, hw_data->get_pf2vf_offset(0), msg);
+		return;
+	}
 	case ADF_PF2VF_MSGTYPE_VERSION_RESP:
 		dev_dbg(&GET_DEV(accel_dev),
 			"Version resp received from PF 0x%x\n", msg);
@@ -128,7 +124,7 @@ static void adf_pf2vf_bh_handler(void *data)
 	}
 
 	/* To ack, clear the PF2VFINT bit */
-	msg &= ~BIT(0);
+	msg &= ~ADF_PF2VF_INT;
 	ADF_CSR_WR(pmisc_bar_addr, hw_data->get_pf2vf_offset(0), msg);
 
 	/* Re-enable PF2VF interrupts */
@@ -278,3 +274,18 @@ err_out:
 	return -EFAULT;
 }
 EXPORT_SYMBOL_GPL(adf_vf_isr_resource_alloc);
+
+int __init adf_init_vf_wq(void)
+{
+	adf_vf_stop_wq = alloc_workqueue("adf_vf_stop_wq", WQ_MEM_RECLAIM, 0);
+
+	return !adf_vf_stop_wq ? -EFAULT : 0;
+}
+
+void adf_exit_vf_wq(void)
+{
+	if (adf_vf_stop_wq)
+		destroy_workqueue(adf_vf_stop_wq);
+
+	adf_vf_stop_wq = NULL;
+}
